@@ -126,11 +126,31 @@ function set_output(output_format, state)
    end
 end
 
+-- This should be keep in sync with parser.lua
+defined_comp_operators = {
+   ["="]=1,
+   ["=="] = 1,
+   ["!"] = 1,
+   ["<="] = 1,
+   [">="] = 1,
+   ["<"] = 1,
+   [">"] = 1,
+   ["contains"] = 1,
+   ["icontains"] = 1,
+   ["glob"] = 1,
+   ["startswith"] = 1,
+   ["endswith"] = 1,
+   ["in"] = 1,
+   ["intersects"] = 1,
+   ["pmatch"] = 1
+}
+
 -- Note that the rules_by_name and rules_by_idx refer to the same rule
 -- object. The by_name index is used for things like describing rules,
 -- and the by_idx index is used to map the relational node index back
 -- to a rule.
 local state = {macros={}, lists={}, filter_ast=nil, rules_by_name={},
+	       exceptions_by_name={},
 	       skipped_rules_by_name={}, macros_by_name={}, lists_by_name={},
 	       n_rules=0, rules_by_idx={}, ordered_rule_names={}, ordered_macro_names={}, ordered_list_names={}}
 
@@ -388,6 +408,53 @@ function load_rules_doc(rules_mgr, doc, load_state)
 	    v['source'] = "syscall"
 	 end
 
+	 -- Add an empty exceptions property to the rule if not
+	 -- defined, but add a warning about defining one
+	 if v['exceptions'] == nil then
+	    warnings[#warnings + 1] = "Rule "..v['rule']..": consider adding an exceptions property to define supported exceptions fields"
+	    v['exceptions'] = {}
+	 end
+
+	 -- Validate the contents of the rule exception
+	 if next(v['exceptions']) ~= nil then
+
+	    for i, eitem in ipairs(v['exceptions']) do
+	       local name = eitem['name']
+	       local fields = eitem['fields']
+	       local comps = eitem['comps']
+
+	       if name == nil then
+		  return false, build_error_with_context(v['context'], "Rule exception item must have name property"), warnings
+	       end
+
+	       if fields == nil then
+		  return false, build_error_with_context(v['context'], "Rule exception item "..name..": must have fields property with a list of fields"), warnings
+	       end
+
+	       if comps == nil then
+		  comps = {}
+		  for c=1,#fields do
+		     table.insert(comps, "=")
+		  end
+		  eitem['comps'] = comps
+	       else
+		  if #fields ~= #comps then
+		     return false, build_error_with_context(v['context'], "Rule exception item "..name..": fields and comps lists must have equal length"), warnings
+		  end
+	       end
+	       for j, fname in ipairs(fields) do
+		  if defined_noarg_filters[fname] == nil then
+		     return false, build_error_with_context(v['context'], "Rule exception item "..name..": field name "..fname.." is not a supported filter field"), warnings
+		  end
+	       end
+	       for j, comp in ipairs(comps) do
+		  if defined_comp_operators[comp] == nil then
+		     return false, build_error_with_context(v['context'], "Rule exception item "..name..": comparison operator "..comp.." is not a supported comparison operator"), warnings
+		  end
+	       end
+	    end
+	 end
+
 	 -- Possibly append to the condition field of an existing rule
 	 append = false
 
@@ -409,6 +476,12 @@ function load_rules_doc(rules_mgr, doc, load_state)
 		  return false, build_error_with_context(v['context'], "Rule " ..v['rule'].. " has 'append' key but no rule by that name already exists"), warnings
 	       end
 	    else
+
+	       -- You can't append exceptions to a rule
+	       if v['exceptions'] ~= nil then
+		  return false, build_error_with_context(v['context'], "Can not append exceptions to existing rule, only conditions"), warnings
+	       end
+
 	       state.rules_by_name[v['rule']]['condition'] = state.rules_by_name[v['rule']]['condition'] .. " " .. v['condition']
 
 	    -- Add the current object to the context of the base rule
@@ -447,6 +520,21 @@ function load_rules_doc(rules_mgr, doc, load_state)
 	       state.skipped_rules_by_name[v['rule']] = v
 	    end
 	 end
+      elseif (v['exception']) then
+
+	 for i, eitem in ipairs(v['items']) do
+	    local name = eitem['name']
+	    local fields = eitem['values']
+
+	    if name == nil then
+	       return false, build_error_with_context(v['context'], "Exception item must have name property"), warnings
+	    end
+
+	    if fields == nil then
+	       return false, build_error_with_context(v['context'], "Exception item "..name..": must have values property with a list of values"), warnings
+	    end
+	 end
+	 state.exceptions_by_name[v['exception']] = v
       else
 	 local context = v['context']
 
@@ -456,6 +544,46 @@ function load_rules_doc(rules_mgr, doc, load_state)
    end
 
    return true, {}, warnings
+end
+
+-- cond and not ((proc.name=apk and fd.directory=/usr/lib/alpine) or (proc.name=npm and fd.directory=/usr/node/bin) or (con
+function build_exception_condition_string(eitem, rexitems)
+
+   local fields = rexitems[eitem['name']]['fields']
+   local comps = rexitems[eitem['name']]['comps']
+
+   local icond = ""
+
+   for i, values in ipairs(eitem['values']) do
+
+      if #fields ~= #values then
+	 return nil, "Exception item "..eitem['name']..": fields and values lists must have equal length"
+      end
+
+      if icond ~= "" then
+	 icond=icond.." or "
+      end
+
+      icond=icond.."("
+
+      for k=1,#fields do
+	 if k > 1 then
+	    icond=icond.." and "
+	 end
+	 -- Quote the value if not already quoted
+	 local ival = values[k]
+	 if string.sub(values[k], 1, 1) ~= "'" and string.sub(values[k], 1, 1) ~= '"' then
+	    ival = "\""..ival.."\""
+	 end
+
+	 icond = icond..fields[k].." "..comps[k]..ival
+      end
+
+      icond=icond..")"
+   end
+
+   return icond, nil
+
 end
 
 -- Returns:
@@ -540,6 +668,52 @@ function load_rules(sinsp_lua_parser,
    -- ordered_rule_{lists,macros,names} to compile them in the order
    -- in which they appeared in the file(s).
    reset_rules(rules_mgr)
+
+   -- Turn exceptions into condition strings and add them to each
+   -- rule's condition
+   for ename, exc in pairs(state.exceptions_by_name) do
+
+      if state.rules_by_name[ename] == nil then
+	 warnings[#warnings + 1] = "No rule matching exception name "..exc['exception']
+      else
+
+	 local rexitems = {}
+
+	 -- Create a map from item name to object, speeds up matching
+	 for i, iobj in ipairs(state.rules_by_name[ename].exceptions) do
+	    rexitems[iobj['name']] = iobj
+	 end
+	 -- Usep the exception items, combined with any exceptions in
+	 -- the rules, to build condition strings to append to the
+	 -- rule's condition.
+	 local econd = ""
+
+	 for i, eitem in ipairs(exc['items']) do
+
+	    if rexitems[eitem['name']] == nil then
+	       warnings[#warnings + 1] = "Exception "..ename..": no set of fields matching name "..eitem['name']
+	    else
+	       icond, err = build_exception_condition_string(eitem, rexitems)
+
+	       if err ~= nil then
+		  return false, nil, build_error_with_context(exc['context'], err), warnings
+	       end
+
+	       if econd == "" then
+		  econd = econd.." and not ("..icond
+	       else
+		  econd = econd.." or "..icond
+	       end
+	    end
+	 end
+
+	 if econd ~= "" then
+	    econd=econd..")"
+
+	    state.rules_by_name[ename]['condition'] = "("..state.rules_by_name[ename]['condition']..") "..econd
+	 end
+      end
+   end
 
    for i, name in ipairs(state.ordered_list_names) do
 
